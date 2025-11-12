@@ -1,0 +1,191 @@
+#!/bin/bash
+
+VPCCTL_HOME="$HOME/.vpcctl"
+CONFIG_FILE="$VPCCTL_HOME/config.json"
+LOG_FILE="$LOG_DIR/vpcctl.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >&2
+}
+
+log "Starting vpcctl cleanup..."
+
+## Checks if config files exists
+if [ ! -f "$CONFIG_FILE" ]; then
+    log "No config file found."
+    exit 0
+fi
+
+log "Stopping all running servers..."
+
+jq -r '.vpcs | to_entries[] | .key as $vpc | .value.subnets | to_entries[] | .key as $subnet | .value.allocated_ips | to_entries[] | "\(.value.pid)"' "$CONFIG_FILE" 2>/dev/null | while read -r pid; do
+    if [ -n "$pid" ] && [ "$pid" != "null" ]; then
+        if kill -0 "$pid" >>"$LOG_FILE" 2>&1; then
+            log "  Killing process: $pid"
+            kill "$pid" >>"$LOG_FILE" 2>&1 || kill -9 "$pid" >>"$LOG_FILE" 2>&1
+        fi
+    fi
+done
+
+log "Removing nginx server directories..."
+find /tmp -maxdepth 1 -type d -name "vpcctl-*" -exec rm -rf {} \; >>"$LOG_FILE" 2>&1
+log "  Removed nginx directories from /tmp"
+
+log "Removing nginx server files..."
+find /tmp -maxdepth 1 -type f -name "vpcctl-*.log" -delete >>"$LOG_FILE" 2>&1
+log "  Removed nginx log files from /tmp"
+
+# Clean up nginx test directories
+if [ -d "/tmp/nginx-vpc" ]; then
+    log "Removing test nginx directory..."
+    rm -rf /tmp/nginx-vpc
+fi
+
+if [ -d "/tmp/test-server" ]; then
+    log "Removing test server directory..."
+    rm -rf /tmp/test-server
+fi
+
+###########################
+# Remove NAT rules
+###########################
+
+log "Cleaning up NAT rules..."
+INTERNET_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+if [ -n "$INTERNET_IFACE" ]; then
+    jq -r '.vpcs[].subnets[] | select(.nat_enabled == true) | .cidr' "$CONFIG_FILE" 2>/dev/null | while read -r cidr; do
+        if [ -n "$cidr" ] && [ "$cidr" != "null" ]; then
+            log "  Removing NAT rule for $cidr"
+            iptables -t nat -D POSTROUTING -s "$cidr" -o "$INTERNET_IFACE" -j MASQUERADE >>"$LOG_FILE" 2>&1 || true
+        fi
+    done
+fi
+
+##########################
+# Remove veth pairs
+#########################
+
+log "Removing peering connections..."
+jq -r '.vpcs | to_entries[] | .key as $vpc1 | .value.peerings[]? | "p-\($vpc1)-\(.)-0"' "$CONFIG_FILE" 2>/dev/null | while read -r veth; do
+    if [ -n "$veth" ]; then
+        log "  Deleting veth: $veth"
+        ip link delete "$veth" >>"$LOG_FILE" 2>&1 || true
+    fi
+done
+
+# Delete all namespaces (this also removes veth pairs)
+log "Removing all network namespaces..."
+jq -r '.vpcs[].subnets[].namespace' "$CONFIG_FILE" 2>/dev/null | while read -r ns; do
+    if [ -n "$ns" ] && [ "$ns" != "null" ]; then
+        log "  Deleting namespace: $ns"
+        ip netns delete "$ns" >>"$LOG_FILE" 2>&1 || true
+    fi
+done
+
+# Remove any orphaned veth pairs
+log "Removing any orphaned veth interfaces..."
+ip link show | grep -E "veth-.*-(h|ns)" | awk '{print $2}' | sed 's/:$//' | while read -r veth; do
+    log "  Deleting orphaned veth: $veth"
+    ip link delete "$veth" >>"$LOG_FILE" 2>&1 || true
+done
+
+# Delete all bridges
+log "Removing all VPC bridges..."
+jq -r '.vpcs[].bridge' "$CONFIG_FILE" 2>/dev/null | while read -r bridge; do
+    if [ -n "$bridge" ] && [ "$bridge" != "null" ]; then
+        log "  Deleting bridge: $bridge"
+        # Remove routes first
+        jq -r --arg bridge "$bridge" '.vpcs[] | select(.bridge == $bridge) | .cidr' "$CONFIG_FILE" | while read -r cidr; do
+            if [ -n "$cidr" ]; then
+                ip route del "$cidr" >>"$LOG_FILE" 2>&1 || true
+            fi
+        done
+        # Delete bridge
+        ip link set "$bridge" down >>"$LOG_FILE" 2>&1 || true
+        ip link delete "$bridge" >>"$LOG_FILE" 2>&1 || true
+    fi
+done
+
+# Clean up any orphaned bridges
+log "Removing any orphaned bridges..."
+ip link show type bridge | grep -E "vpcbr-" | awk '{print $2}' | sed 's/:$//' | while read -r bridge; do
+    log "  Deleting orphaned bridge: $bridge"
+    ip link set "$bridge" down >>"$LOG_FILE" 2>&1 || true
+    ip link delete "$bridge" >>"$LOG_FILE" 2>&1 || true
+done
+
+#################################
+# Reset config file to defaults
+#################################
+
+log "Resetting config file..."
+cat > "$CONFIG_FILE" << EOF
+{
+  "vpcs": {},
+  "settings": {
+    "ip_allocation": {
+      "start_offset": 10,
+      "reserved_ips": ["0", "1", "2", "255"]
+    },
+    "limits": {
+      "max_vpcs": 50,
+      "max_subnets_per_vpc": 100
+    }
+  }
+}
+EOF
+
+#############################
+# Run final cleanup checks
+#############################
+
+log "Running final cleanup checks..."
+
+# namespaces
+REMAINING_NS=$(ip netns list | grep -E "vpcns-" || true)
+if [ -n "$REMAINING_NS" ]; then
+    log "WARNING: Some namespaces still exist:"
+    echo "$REMAINING_NS" | while read -r ns; do
+        log "  - $ns"
+        ip netns delete "$ns" >>"$LOG_FILE" 2>&1 || true
+    done
+fi
+
+# bridges
+REMAINING_BRIDGES=$(ip link show type bridge | grep -E "vpcbr-" || true)
+if [ -n "$REMAINING_BRIDGES" ]; then
+    log "WARNING: Some bridges still exist:"
+    echo "$REMAINING_BRIDGES" | awk '{print $2}' | sed 's/:$//' | while read -r bridge; do
+        log "  - $bridge"
+        ip link set "$bridge" down >>"$LOG_FILE" 2>&1 || true
+        ip link delete "$bridge" >>"$LOG_FILE" 2>&1 || true
+    done
+fi
+
+# veth pairs
+REMAINING_VETH=$(ip link show | grep -E "(veth-|peer-)" || true)
+if [ -n "$REMAINING_VETH" ]; then
+    log "WARNING: Some veth interfaces still exist:"
+    echo "$REMAINING_VETH" | awk '{print $2}' | sed 's/:$//' | while read -r veth; do
+        log "  - $veth"
+        ip link delete "$veth" >>"$LOG_FILE" 2>&1 || true
+    done
+fi
+
+# orphaned processes
+REMAINING_PROCS=$(ps aux | grep -E "(nginx.*vpcctl|python3.*vpcctl)" | grep -v grep || true)
+if [ -n "$REMAINING_PROCS" ]; then
+    log "WARNING: Some processes still running:"
+    echo "$REMAINING_PROCS" | while read -r proc; do
+        PID=$(echo "$proc" | awk '{print $2}')
+        log "  - PID $PID"
+        kill -9 "$PID" >>"$LOG_FILE" 2>&1 || true
+    done
+fi
+
+log "Cleanup complete!"
+
+if [ -f "$LOG_FILE" ]; then
+    mv "$LOG_FILE" "vpcctl-$(date +%Y%m%d-%H%M%S).log"
+fi
+echo ""

@@ -1,0 +1,13 @@
+{
+  "vpcs": {},
+  "settings": {
+    "ip_allocation": {
+      "start_offset": 10,
+      "reserved_ips": ["0", "1", "2", "255"]
+    },
+    "limits": {
+      "max_vpcs": 50,
+      "max_subnets_per_vpc": 100
+    }
+  }
+}

@@ -1,0 +1,182 @@
+#!/bin/bash
+set -e
+
+VPCCTL_HOME="$HOME/.vpcctl"
+LIB_DIR="$VPCCTL_HOME/lib"
+
+if [ -f .env ]; then
+    set -a
+    source .env
+    set +a
+fi
+
+source "$LIB_DIR/utils.sh"
+source "$LIB_DIR/vpc.sh"
+source "$LIB_DIR/subnet.sh"
+source "$LIB_DIR/routing.sh"
+source "$LIB_DIR/peering.sh"
+source "$LIB_DIR/firewall.sh"
+source "$LIB_DIR/deploy.sh"
+
+check_dependencies
+init_config_defaults
+
+case "$1" in
+    create)
+        case "$2" in
+            vpc)
+                # vpcctl create vpc <name> <cidr>
+                create_vpc "$3" "$4"
+                ;;
+            subnet)
+                # vpcctl create subnet <vpc> <subnet-name> <cidr> <type>
+                create_subnet "$3" "$4" "$5" "$6"
+                ;;
+            peering)
+                # vpcctl create peering <vpc1> <vpc2>
+                create_peering "$3" "$4"
+                ;;
+            *)
+                log "ERROR" "Unknown create target: $2"
+                show_usage
+                exit 1
+                ;;
+        esac
+        ;;
+    rm)
+        case "$2" in
+            vpc)
+                # vpcctl rm vpc <name>
+                delete_vpc "$3"
+                ;;
+            subnet)
+                # vpcctl rm subnet <vpc> <subnet-name>
+                delete_subnet "$3" "$4"
+                ;;
+            peering)
+                # vpcctl rm peering <vpc1> <vpc2>
+                delete_peering "$3" "$4"
+                ;;
+            *)
+                log "ERROR" "Unknown rm target: $2"
+                show_usage
+                exit 1
+                ;;
+        esac
+        ;;
+    ls)
+        case "$2" in
+            vpcs|"")
+                list_vpcs
+                ;;
+            subnets)
+                # vpcctl ls subnets <vpc>
+                list_subnets "$3"
+                ;;
+            *)
+                log "ERROR" "Unknown ls target: $2"
+                show_usage
+                exit 1
+                ;;
+        esac
+        ;;
+    deploy)
+        case "$2" in
+            nginx)
+                # vpcctl deploy nginx <vpc> <subnet> <port> [--ip <ip>]
+                deploy_server "${@:3}"
+                ;;
+            python)
+                # vpcctl deploy python <vpc> <subnet> <port>
+                deploy_python_server "$3" "$4" "$5"
+                ;;
+            *)
+                log "ERROR" "Unknown deploy type: $2"
+                log "ERROR" "Supported types: nginx, python"
+                exit 1
+                ;;
+        esac
+        ;;
+    run)
+        # vpcctl run <vpc> <subnet> <command> [args...]
+        run_in_subnet "$2" "$3" "${@:4}"
+        ;;
+    test)
+        # vpcctl test <vpc> <source-subnet> <target-ip> [port] [protocol]
+        test_connectivity "$2" "$3" "$4" "$5" "$6"
+        ;;
+    get-ip)
+        # vpcctl get-ip <vpc> <subnet> [service-name]
+        get_service_ip "$2" "$3" "$4"
+        ;;
+    firewall)
+        case "$2" in
+            vpc)
+                case "$3" in
+                    remove|rm)
+                        # vpcctl firewall vpc remove <vpc>
+                        remove_vpc_firewall "$4"
+                        ;;
+                    *)
+                        # vpcctl firewall vpc <vpc> <policy-file>
+                        apply_vpc_firewall "$3" "$4"
+                        ;;
+                esac
+                ;;
+            remove|rm)
+                # vpcctl firewall rm <vpc> <subnet>
+                remove_firewall "$3" "$4"
+                ;;
+            show)
+                # vpcctl firewall show <vpc> <subnet>
+                show_firewall "$3" "$4"
+                ;;
+            *)
+                # vpcctl firewall <vpc> <subnet> <policy-file>
+                apply_firewall "$2" "$3" "$4"
+                ;;
+        esac
+        ;;
+    config)
+        case "$2" in
+            get)
+                # vpcctl config get <path>
+                if [ -z "$3" ]; then
+                    log "ERROR" "Usage: vpcctl config get <path>"
+                    log "ERROR" "Example: vpcctl config get '.settings.ip_allocation.start_offset'"
+                    exit 1
+                fi
+                get_config_value "$3" "null"
+                ;;
+            set)
+                # vpcctl config set <path> <value>
+                if [ -z "$3" ] || [ -z "$4" ]; then
+                    log "ERROR" "Usage: vpcctl config set <path> <value>"
+                    log "ERROR" "Example: vpcctl config set '.settings.ip_allocation.start_offset' 20"
+                    exit 1
+                fi
+                set_config_value "$3" "$4"
+                log "INFO" "Configuration updated: $3 = $4"
+                ;;
+            show)
+                # vpcctl config show
+                cat "$CONFIG_FILE" | jq '.'
+                ;;
+            *)
+                log "ERROR" "Usage: vpcctl config [get|set|show]"
+                log "ERROR" "  get <path>   - Get configuration value"
+                log "ERROR" "  set <path> <value> - Set configuration value"
+                log "ERROR" "  show         - Show entire configuration"
+                exit 1
+                ;;
+        esac
+        ;;
+    show-logs)
+        # vpcctl show-logs
+        cat $LOG_FILE
+        ;;
+    *)
+        show_usage
+        exit 1
+        ;;
+esac
