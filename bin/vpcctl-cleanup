@@ -186,6 +186,6 @@ fi
 log "Cleanup complete!"
 
 if [ -f "$LOG_FILE" ]; then
-    mv "$LOG_FILE" "vpcctl-$(date +%Y%m%d-%H%M%S).log"
+    mv "$LOG_FILE" "$LOG_DIR/vpcctl-$(date +%Y%m%d-%H%M%S).log"
 fi
 echo ""
